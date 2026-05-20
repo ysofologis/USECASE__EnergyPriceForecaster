@@ -34,7 +34,65 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class XGBConfig:
-    """XGBoost hyperparameters and training configuration."""
+    """
+    Hyperparameter settings for the XGBoost price forecasting model.
+
+    Think of these as the "knobs" that control how the model learns.
+    The defaults are sensible starting points — only change them if you
+    have a reason and can measure whether the change helps.
+
+    What each group of knobs does
+    -----------------------------
+    Tree settings (how complex each decision tree is):
+
+    ``max_depth`` — How many decisions deep each tree can go.
+        Default 6.  Higher = more complex patterns, but risks overfitting.
+        Think of it like: "Ask at most 6 yes/no questions before making a guess."
+
+    ``min_child_weight`` — How many data points must land in each leaf.
+        Default 10.  Higher = more conservative (harder to split into tiny groups).
+
+    ``subsample`` — What fraction of training rows each tree sees.
+        Default 0.8 = 80 %.  Reduces overfitting by showing each tree a
+        slightly different view of the data.
+
+    ``colsample_bytree`` — What fraction of features each tree sees.
+        Default 0.8 = 80 %.  Similar benefit to subsample but at the
+        feature level.
+
+    Regularization (how much to penalise complexity):
+
+    ``reg_alpha`` (L1) — Encourages the model to ignore noisy features.
+        Default 0.1.  Set higher if you suspect many irrelevant features.
+
+    ``reg_lambda`` (L2) — Dampens large predictions.
+        Default 1.0.  The standard regularization knob — almost always leave at 1.0.
+
+    Learning (how fast the model adjusts):
+
+    ``learning_rate`` — How much each tree can adjust the prediction.
+        Default 0.05.  Smaller = slower learning, but less likely to overshoot.
+        Typically paired with a larger ``n_estimators``.
+
+    ``n_estimators`` — Maximum number of trees to train.
+        Default 2000, but early stopping usually stops around 50–200.
+        Set higher if ``learning_rate`` is low.
+
+    Training windows (how much history to use):
+
+    ``min_train_size`` — Minimum hours of history required.
+        Default 4,320h (~6 months).  Fewer months = risk of not capturing
+        seasonal patterns (e.g. winter/summer demand differences).
+
+    ``val_size`` — Hours held out for early stopping.
+        Default 168h (1 week).  The last week of training data is used to
+        decide when to stop adding trees.
+
+    Example
+    -------
+    >>> cfg = XGBConfig(max_depth=8, learning_rate=0.03, n_estimators=3000)
+    >>> model = XGBPriceModel(config=cfg)
+    """
 
     # ── XGBoost tree settings
     max_depth: int = 6
@@ -206,62 +264,105 @@ def compare_baselines(
 
 class XGBPriceModel:
     """
-    XGBoost single-step price forecaster for the Greek bidding zone.
+    XGBoost price forecaster for the Greek electricity bidding zone.
 
-    Training
-    -------
-    Uses an **expanding window**: the model is trained on all data from
-    ``min_train_size`` hours up to each test timestamp, with a rolling
-    1-week validation set for early stopping.
+    What this model does
+    ---------------------
+    Given the last few weeks of grid + weather data, it predicts what each
+    of tomorrow's 24 hourly electricity prices will be (in EUR/MWh).
 
-    Forecasting
-    ----------
-    ``forecast_24h()`` produces 24 hourly forecasts using a **recursive**
-    strategy: each T+h prediction is fed back as the ``price_lag_24h`` /
-    ``price_lag_48h`` / etc. features for the next step. This allows the
-    model to compound its own error but is simple to implement and has
-    been shown competitive with direct multi-output strategies.
+    It does NOT predict the future perfectly — it learns patterns from history:
+    e.g. "prices tend to spike at 8am on weekday mornings in winter" or
+    "high solar output on sunny afternoons drives prices down".
 
-    SHAP
-    ----
-    ``shap_summary()`` runs TreeExplainer on the fitted model and returns
-    mean absolute SHAP values per feature (requires ``shap`` to be installed).
+    Two modes of forecasting are supported:
+
+    1. Single-step (evaluate)
+       You have historical data including the actual price.  The model
+       predicts the next hour.  Useful for measuring accuracy on known data.
+
+    2. Recursive / 24h forecast (forecast_24h)
+       You only have data up to today 23:00.  The model predicts hour T+1.
+       That prediction is fed back as input to predict T+2, and so on.
+       This simulates real-world conditions where tomorrow's "actual" prices
+       are not yet known.
+
+    Training strategy
+    -----------------
+    The model is retrained regularly (ideally weekly) on all available history.
+    It uses an **expanding window**: the training set grows as new data arrives.
+    A **validation hold-out** (last week) is used for early stopping, which
+    prevents the model from overfitting — learning noise instead of signal.
 
     Parameters
     ----------
     config : XGBConfig
-        Hyperparameters and training settings.
+        Hyperparameter settings (tree depth, learning rate, regularization, etc.).
+        Defaults to sensible values; only override if you have a reason.
     target_col : str
-        Name of the price column (auto-detected from the feature DataFrame
-        if omitted).
+        Name of the price column in the input DataFrame.
+        Auto-detected if omitted (tries "price_gr" first).
     lag_features : tuple of int
-        Passed to FeatureEngineer. Default (24, 48, 168, 336).
+        How far back to look for price patterns, in hours.
+        Default (24, 48, 168, 336) means:
+        - 24h ago  — same hour yesterday
+        - 48h ago  — same hour two days ago
+        - 168h ago — same hour last week
+        - 336h ago — same hour two weeks ago
     seasonal_years : tuple of int
-        Passed to FeatureEngineer for Greek holiday calendar coverage.
+        Which calendar years to include in the Greek holiday table.
     include_dst : bool
-        Passed to FeatureEngineer.
+        Whether to add Daylight Saving Time transition flags.
+        Greece switches clocks in March and October — these shifts confuse
+        naive hourly models, so explicit DST features help.
     verbose : bool
-        Print training progress.
+        Print training progress messages.
 
     Attributes
     ----------
     model_ : xgboost.XGBRegressor
-        The fitted booster.
+        The fitted XGBoost model.  Access this to inspect individual trees
+        or use the model outside this class.
     feature_cols_ : list of str
-        Names of the features used for training (excluding the target).
-    feature_importance_ : dict  (set after shap_summary())
-        Feature → mean |SHAP| values.
+        Names of the columns the model was trained on.  Any new input DataFrame
+        must have these exact columns.
+    feature_importance_ : dict
+        Mean absolute SHAP values per feature.  Set by ``shap_summary()``.
+        Higher value = more influential on the model's predictions.
     config_ : XGBConfig
-        Effective config used (may differ from input if using defaults).
+        The hyperparameter configuration used (may differ from input defaults).
 
-    Examples
-    --------
+    Example usage
+    -------------
     >>> from gridprice.models import XGBPriceModel
-    >>> model = XGBPriceModel()
-    >>> model.fit(df_train)
-    >>> forecasts = model.forecast_24h(df_train.iloc[-24:])   # last known 24h
+    >>> from gridprice.synthetic_data import SyntheticDataGenerator
+    >>> from datetime import date
+    >>>
+    >>> # 1. Generate training data (replace with real ENTSO-E data in production)
+    >>> df = SyntheticDataGenerator(bidding_zone="GR", seed=42, end_date=date(2024, 6, 1)).generate()
+    >>>
+    >>> split = int(len(df) * 0.8)
+    >>> df_train, df_test = df.iloc[:split], df.iloc[split:]
+    >>>
+    >>> # 2. Train the model
+    >>> model = XGBPriceModel(verbose=True)
+    >>> model.fit(df_train)          # ~2 min on synthetic data
+    >>>
+    >>> # 3. Evaluate on held-out test data (single-step)
     >>> metrics = model.evaluate(df_test)
-    >>> shap = model.shap_summary(df_test.head(1000))          # needs shap installed
+    >>> print(f"MAE: {metrics['MAE']:.2f} EUR/MWh")
+    >>>
+    >>> # 4. Produce a 24h forecast (recursive — how you'd use it in production)
+    >>> forecast = model.forecast_24h(df_train.iloc[-500:])
+    >>> print(forecast.head())
+    >>>
+    >>> # 5. Inspect which features matter most
+    >>> fi = model.feature_importance_df()
+    >>> print(fi.head(5))
+    >>>
+    >>> # 6. Save to disk
+    >>> model.save("models/xgb_model.pkl")
+    >>> loaded = XGBPriceModel.load("models/xgb_model.pkl")  # recreate from disk
     """
 
     def __init__(
@@ -314,26 +415,73 @@ class XGBPriceModel:
         eval_fraction: float = 0.1,
     ) -> "XGBPriceModel":
         """
-        Fit the XGBoost model using expanding-window + early stopping.
+        Train (or retrain) the XGBoost model on historical price data.
 
-        The training window expands by one week at a time.  At each
-        expansion step the model is re-fitted with early stopping on
-        the latest ``val_size`` hours.  The final model uses the
-        average best-iteration count across all expansion steps
-        (a simple heuristic; more sophisticated would be to take the
-        median and freeze at that number).
+        What happens inside
+        -------------------
+        The training process has three phases:
+
+        Phase 1 — Feature engineering
+            Raw grid + weather data is transformed into 51 numeric features:
+            calendar (hour, day-of-week, holiday), cyclical encodings (sin/cos of hour),
+            lag features (price 24h/48h/168h ago), rolling statistics (24h/168h means),
+            weather variables, and grid-level variables (residual load, renewable share).
+            NaN rows (from lag windows at the start of the series) are dropped.
+
+        Phase 2 — Expanding window
+            The model is trained multiple times, each time expanding the training
+            window by one week.  At each step the last ``val_size`` hours are
+            held out as a validation set and early stopping is applied.  The number
+            of boosting rounds that performed best on validation is recorded.
+            This is a standard technique to (a) prevent overfitting and (b) pick
+            a reasonable number of trees without manual tuning.
+
+            Why expand?  Rather than training on just the last 6 months, we train
+            on 6 months, then 6 months + 1 week, then 6 months + 2 weeks, and so on.
+            This simulates how the model would have performed if it had been
+            deployed at each point in history — giving a realistic picture of
+            what accuracy to expect in production.
+
+        Phase 3 — Final retrain
+            All recorded best-iteration counts are averaged.  A final model is
+            trained on all training data using that average + 5 as the tree count.
+            This final model is what gets used for forecasting.
 
         Parameters
         ----------
         df : DataFrame with DatetimeIndex
-            Raw (pre-feature) training data.
+            Raw (pre-feature) hourly data.  Must contain at minimum:
+            - ``price_gr`` (or the configured target column): hourly price in EUR/MWh
+            - ``load_gr``: hourly total electricity load in MW
+            - Weather columns: ``temperature_2m_c``, ``wind_speed_10m_ms``,
+              ``cloud_cover``, ``solar_irradiance_wm2``
+            Columns not present are silently ignored (the model will just have
+            fewer features).
+
         eval_fraction : float
-            Fraction of ``df`` to hold out as final evaluation set
-            (used only for the last training step).
+            Fraction of ``df`` to hold out for the final validation step.
+            Default 0.1 = last 10 % of the series.
+            Must contain at least ``val_size`` hours (168h = 1 week by default).
 
         Returns
         -------
-        self
+        self (allows method chaining: ``model = XGBPriceModel().fit(df)``)
+
+        Raises
+        ------
+        ValueError
+            If ``df`` has fewer than ``min_train_size`` rows after dropping NaNs
+            (i.e. too little history to build lag features).
+        RuntimeError
+            If the expanding window produces zero valid training steps
+            (usually means the dataset is too short).
+
+        Example
+        -------
+        >>> model = XGBPriceModel(verbose=True)
+        >>> model.fit(df_train)          # ~2 min on 2 years of hourly data
+        [XGBPriceModel] 17520 rows, 1752 held for eval, step=168h, val_size=168h
+        [XGBPriceModel] Avg best iteration: 87 (range 42-156)
         """
         # ── 1. Engineer features ──────────────────────────────────────
         fe = self.FE(
@@ -451,14 +599,39 @@ class XGBPriceModel:
 
     def predict(self, X: pd.DataFrame) -> pd.Series:
         """
-        Single-step prediction for a feature matrix.
+        Predict the next hour's price for a feature matrix (single-step).
 
-        X must have the same columns (in the same order) as the training
-        features.  Use ``prepare_features()`` to convert raw data.
+        This is a **batch prediction**: all rows in ``X`` are predicted
+        independently.  It does NOT chain predictions — each row is treated
+        as if the correct features are already available.  For chained
+        24-step-ahead forecasting, use ``forecast_24h()`` instead.
+
+        Parameters
+        ----------
+        X : DataFrame
+            Feature matrix.  Must have exactly the columns the model was
+            trained on (``model.feature_cols_``) in the same order.
+            Typically produced by passing raw data through a FeatureEngineer:
+            ``df_fe = FeatureEngineer().fit_transform(df)``.
+            Use ``df_fe.dropna()`` to remove rows with NaN (lag warm-up period).
 
         Returns
         -------
-        Series with the same index as X, or integer index if X has no index.
+        Series of predicted prices in EUR/MWh, indexed the same as ``X``.
+        NaN values in ``X`` produce NaN predictions.
+
+        Example
+        -------
+        >>> # Engineer features for test data
+        >>> fe = FeatureEngineer(lag_features=(24, 48, 168, 336))
+        >>> df_fe = fe.fit_transform(df_test).dropna()
+        >>>
+        >>> # Batch predict — no chaining, each row independent
+        >>> preds = model.predict(df_fe)
+        >>> print(preds.head())
+        2024-05-20 00:00:00+03:00     87.34
+        2024-05-20 01:00:00+03:00     81.12
+        ...
         """
         if not self._fitted:
             raise ValueError("Model has not been fitted. Call fit() first.")
@@ -474,19 +647,69 @@ class XGBPriceModel:
         horizon: int = 24,
     ) -> pd.Series:
         """
-        Recursive 24-step-ahead forecast starting from ``last_known``.
+        Produce N hours of price forecasts starting from the last known timestamp.
+
+        This is the **production method** — how the model would be used in a
+        daily pipeline.  It uses a **recursive (autoregressive) strategy**:
+
+        Step-by-step example (for horizon=3):
+        ┌─────────────────────────────────────────────────────────────┐
+        │ last_known: data up to Mon 23:00                            │
+        │                                                             │
+        │  1. Engineer features using data up to Mon 23:00             │
+        │  2. Predict Tue 00:00  ← [forecast_1]                       │
+        │  3. Append [forecast_1] as if it were the actual price     │
+        │  4. Engineer features using data up to Tue 00:00             │
+        │  5. Predict Tue 01:00  ← [forecast_2]                      │
+        │  6. Append [forecast_2] ...                                 │
+        │  7. Predict Tue 02:00  ← [forecast_3]                      │
+        └─────────────────────────────────────────────────────────────┘
+
+        Why not predict all 24 hours at once?
+        Direct multi-output (train one model to output 24 values) would avoid
+        error compounding but requires significantly more engineering.
+        Recursive is simpler, well-studied, and competitive in practice.
+        Error does compound — hour 24 is typically less accurate than hour 1 —
+        but the model is still useful if this degradation is quantified.
 
         Parameters
         ----------
-        last_known : DataFrame
-            Raw (pre-feature) data ending at the last known timestamp.
-            Must contain at least ``max(lag_features)`` hours of history.
+        last_known : DataFrame with DatetimeIndex
+            Raw hourly data ending at the last timestamp you actually know.
+            Must contain at least ``max(lag_features)`` hours (default: 336h = 2 weeks)
+            to build lag and rolling features correctly.
+            Must contain the target price column (``price_gr`` or equivalent).
+
         horizon : int
-            Number of hours to forecast (default 24).
+            How many hours ahead to forecast.  Default 24 (full day-ahead market).
+            Can be set lower (e.g. 6) for intraday use or higher (e.g. 48) if needed.
 
         Returns
         -------
-        Series of ``horizon`` price predictions, indexed by forecast timestamp.
+        Series of ``horizon`` price predictions in EUR/MWh.
+        Index: DatetimeIndex starting at ``last_known.index[-1] + 1 hour``,
+        same timezone as ``last_known``.
+
+        Raises
+        ------
+        ValueError
+            If ``last_known`` has fewer rows than ``max(lag_features)``.
+        ValueError
+            If called before ``fit()``.
+
+        Example
+        -------
+        >>> # You have data up to yesterday 23:00 — now predict today 00:00 to 23:00
+        >>> forecast = model.forecast_24h(df_train.iloc[-500:])
+        >>> print(forecast)
+        2024-06-02 00:00:00+03:00     87.34
+        2024-06-02 01:00:00+03:00     81.12
+        ...
+        2024-06-02 23:00:00+03:00     92.05
+        Length: 24
+
+        >>> # Or for an intraday 6-hour ahead forecast:
+        >>> intraday = model.forecast_24h(df_train.iloc[-100:], horizon=6)
         """
         if not self._fitted:
             raise ValueError("Model has not been fitted. Call fit() first.")
@@ -546,18 +769,67 @@ class XGBPriceModel:
         metrics: Tuple[str, ...] = ("MAE", "RMSE", "MAPE", "sMAPE"),
     ) -> Dict[str, float]:
         """
-        Evaluate single-step forecasts on a hold-out test set.
+        Measure how accurate the model is on a held-out test period.
+
+        This is a **single-step evaluation**: for each hour in the test set,
+        the model sees all features INCLUDING the actual price (lag features
+        are computed using actuals, not predictions).  This gives the most
+        optimistic accuracy estimate — in real recursive forecasting, errors
+        compound because the model doesn't have perfect lag features.
+
+        Use ``evaluate_recursive()`` to measure realistic performance where
+        the model must rely on its own previous predictions.
+
+        What the metrics mean
+        --------------------
+        MAE  (Mean Absolute Error)
+            Average prediction error in EUR/MWh.  E.g. MAE = 5 means
+            the model's forecast is off by 5 EUR/MWh on average.
+            The most interpretable metric.
+
+        RMSE (Root Mean Squared Error)
+            Like MAE but squares errors before averaging — heavily penalises
+            large mistakes.  If RMSE ≫ MAE, the model occasionally makes
+            big mistakes (e.g. misses a price spike).
+
+        MAPE (Mean Absolute Percentage Error)
+            Average percentage error relative to the actual price.
+            E.g. MAPE = 15% means predictions are off by 15% on average.
+            Problematic when prices are near zero or negative.
+
+        sMAPE (Symmetric MAPE)
+            Like MAPE but symmetric — equally penalises over- and under-prediction
+            regardless of the actual price level.  Better behaved for energy
+            prices which can swing from 0 to 300+ EUR/MWh.
 
         Parameters
         ----------
-        df_test : DataFrame
-            Raw (pre-feature) test data with the same columns as training.
+        df_test : DataFrame with DatetimeIndex
+            Raw (pre-feature) test data.  Must contain the target price column.
+            Must be long enough to build lag/rolling features:
+            ``len(df_test)`` should be at least ``max(lag_features)`` + 1.
+
         metrics : tuple of str
-            Which metrics to compute. Options: MAE, RMSE, MAPE, sMAPE.
+            Which metrics to compute.  Subset of {"MAE", "RMSE", "MAPE", "sMAPE"}.
+            All four are computed by default.
 
         Returns
         -------
-        dict of metric_name → float
+        dict of metric_name → float value.
+        NaN is returned for MAPE/sMAPE if the test set contains zero prices.
+
+        Example
+        -------
+        >>> # Hold out the last 20% of data for evaluation
+        >>> split = int(len(df) * 0.8)
+        >>> df_train, df_test = df.iloc[:split], df.iloc[split:]
+        >>>
+        >>> model.fit(df_train)
+        >>> metrics = model.evaluate(df_test)
+        >>>
+        >>> print(f"MAE:   {metrics['MAE']:.2f} EUR/MWh")
+        >>> print(f"RMSE:  {metrics['RMSE']:.2f} EUR/MWh")
+        >>> print(f"sMAPE: {metrics['sMAPE']:.1f}%")
         """
         if not self._fitted:
             raise ValueError("Model has not been fitted.")
@@ -586,14 +858,63 @@ class XGBPriceModel:
         horizon: int = 24,
     ) -> pd.DataFrame:
         """
-        Evaluate recursive multi-step forecasting on the test set.
+        Measure accuracy of recursive multi-step forecasting on the test set.
 
-        For each ``horizon``-hour block in ``df_test``, produces a
-        recursive forecast starting from the block's preceding data.
+        This is the **realistic accuracy test**.  Unlike ``evaluate()`` which
+        uses actual prices for lag features, this method forces the model to
+        use its own previous predictions as inputs — exactly as it would in
+        production.
 
-        Returns a DataFrame with columns ``y_true`` and ``y_pred`` indexed
-        by timestamp, plus a ``horizon`` column indicating how many steps
-        ahead each prediction was made.
+        How it works
+        ------------
+        The test set is split into non-overlapping blocks of ``horizon`` hours.
+        For each block:
+
+        1. History before the block is taken as ``last_known``.
+        2. ``forecast_24h(history, horizon)`` is called — producing a
+           recursive forecast for the entire block.
+        3. Each predicted hour is compared to the actual price.
+
+        This gives you per-hour accuracy broken down by how many steps ahead
+        the forecast was made (h=1 is usually most accurate, h=24 is least).
+
+        Parameters
+        ----------
+        df_test : DataFrame with DatetimeIndex
+            Raw (pre-feature) test data.  Must contain the target price column.
+            Must be at least ``max(lag_features) + horizon`` hours long.
+
+        horizon : int
+            Number of hours to forecast per block.  Default 24.
+            The step between block starts is also ``horizon`` (non-overlapping blocks).
+
+        Returns
+        -------
+        DataFrame with one row per forecast hour, indexed by timestamp.
+
+        Columns
+        -------
+        horizon  : int   — 1 to N, how many hours ahead this prediction was made
+        y_true   : float — actual price (EUR/MWh) at this hour
+        y_pred   : float — model's recursive prediction (EUR/MWh)
+
+        Use this to answer questions like:
+        - "On average, how wrong is the 24-hour-ahead forecast?"
+        - "Do errors grow linearly with horizon, or plateau after h=12?"
+
+        Example
+        -------
+        >>> results = model.evaluate_recursive(df_test, horizon=24)
+        >>>
+        >>> # Average error at each horizon
+        >>> results["error"] = results["y_true"] - results["y_pred"]
+        >>> print(results.groupby("horizon")["error"].abs().mean())
+        horizon
+        1      1.23
+        6      2.87
+        12     4.15
+        24     6.42
+        Name: error, dtype: float64
         """
         if not self._fitted:
             raise ValueError("Model has not been fitted.")
@@ -632,21 +953,46 @@ class XGBPriceModel:
         max_display: int = 25,
     ) -> Dict[str, float]:
         """
-        Compute mean absolute SHAP values for each feature.
+        Compute SHAP (SHapley Additive exPlanations) feature importance.
 
-        Requires ``shap`` to be installed (``pip install shap``).
+        SHAP explains each individual prediction by assigning each feature
+        a "contribution score" — how much that feature pushed the prediction
+        up or down relative to the average prediction.  This method averages
+        the absolute contribution scores across all rows in ``df_sample``,
+        giving an overall ranking of which features matter most.
+
+        Think of it as: "On average across these predictions, which features
+        had the biggest influence on the price forecast?"
+
+        Requires ``shap`` package: ``pip install shap``.
 
         Parameters
         ----------
         df_sample : DataFrame
-            Feature-engineered sample (from ``fe.transform()``).
-            A subset of 500-2000 rows is recommended for speed.
+            Feature-engineered sample rows.  Must have the same columns
+            as ``self.feature_cols_``.  Use 500–2000 rows for a good
+            balance between coverage and speed.  Example:
+            ``df_sample = FeatureEngineer().fit_transform(df_test).dropna().iloc[:1000]``
+
         max_display : int
-            Passed to shap.summary_plot / shap.plots.bar.
+            How many features to show in the beeswarm plot (set by ``shap_plot()``).
 
         Returns
         -------
-        dict of feature_name → mean |SHAP value|
+        dict of feature_name → mean |SHAP value| (higher = more important).
+
+        The result is also stored in ``self.feature_importance_`` for later use.
+
+        Example
+        -------
+        >>> fi = model.shap_summary(df_sample)
+        >>> for feat, score in sorted(fi.items(), key=lambda x: -x[1])[:5]:
+        ...     print(f"  {feat:30s} {score:.4f}")
+          price_roll_zscore_168h          12.3421
+          price_vs_7d_mean                 8.2154
+          renewable_share                   5.8732
+          temperature_2m_c                 4.1023
+          hour_of_week                     3.9871
         """
         try:
             import shap
@@ -668,7 +1014,31 @@ class XGBPriceModel:
         return importance
 
     def shap_plot(self, df_sample: pd.DataFrame, save_path: Optional[Path] = None) -> None:
-        """Generate SHAP beeswarm summary plot (requires shap)."""
+        """
+        Generate and display a SHAP beeswarm summary plot.
+
+        The beeswarm plot shows every prediction as a dot per feature:
+        - Horizontal position = SHAP value (how much this feature moved the prediction)
+        - Color = feature value (red = high, blue = low)
+        - Clustering at the top = high-impact features
+
+        This is the standard way to understand *why* the model makes certain
+        predictions, beyond just knowing *what* the predictions are.
+
+        Requires ``shap`` package: ``pip install shap``.
+
+        Parameters
+        ----------
+        df_sample : DataFrame
+            Feature-engineered sample rows (same as for ``shap_summary()``).
+        save_path : Path, optional
+            If provided, saves the plot to this path instead of displaying it.
+
+        Example
+        -------
+        >>> model.shap_plot(df_sample)                       # display inline
+        >>> model.shap_plot(df_sample, save_path="reports/figures/shap.png")
+        """
         try:
             import shap
         except ImportError:
@@ -694,7 +1064,33 @@ class XGBPriceModel:
 
     def feature_importance_df(self) -> pd.DataFrame:
         """
-        Return a DataFrame of XGBoost native feature importance (gain).
+        Return XGBoost's native feature importance scores (gain-based).
+
+        "Gain" measures how much each feature improves the model's accuracy
+        (reduction in prediction error) when used to split a tree node.
+        This is XGBoost's built-in metric — simpler than SHAP, faster to compute,
+        but less precise for understanding individual predictions.
+
+        Use this for a quick overview; use ``shap_summary()`` when you need
+        rigorous, per-prediction explanations.
+
+        Returns
+        -------
+        DataFrame with columns:
+        - ``feature`` : feature name
+        - ``importance`` : gain-based importance score (higher = more important)
+        Sorted descending by importance.
+
+        Example
+        -------
+        >>> fi = model.feature_importance_df()
+        >>> print(fi.head(10).to_string(index=False))
+          feature               importance
+          price_roll_zscore_168h     0.182
+          price_vs_7d_mean          0.134
+          renewable_share           0.098
+          temperature_2m_c          0.072
+          hour_of_week              0.065
         """
         if not self._fitted:
             raise ValueError("Model has not been fitted.")
@@ -708,7 +1104,38 @@ class XGBPriceModel:
     # ── Save / Load ────────────────────────────────────────────────────
 
     def save(self, path: Path) -> None:
-        """Save model, config, and feature column names to ``path``."""
+        """
+        Persist the trained model to disk using pickle.
+
+        Saves everything needed to recreate the model: the fitted XGBoost
+        booster, the hyperparameter config, the list of feature column names,
+        and the target column name.
+
+        Files are typically ~1–5 MB depending on the number of trees.
+
+        Parameters
+        ----------
+        path : Path (or str)
+            Destination file path.  The parent directory is created if it
+            doesn't exist.  Convention: ``models/xgb_model.pkl`` or
+            ``models/xgb_2024-06-01.pkl`` for dated backups.
+
+        Note
+        ----
+        The model does NOT save the feature engineer's state.  Lag features,
+        rolling windows, and holiday calendars are recomputed at prediction time
+        from the raw data.  This means: (a) you don't need to version the
+        feature logic separately, and (b) predictions will always use the
+        current version of the feature engineering code.
+
+        Example
+        -------
+        >>> from pathlib import Path
+        >>> model.save(Path("models/xgb_2024-06-01.pkl"))
+        >>> # Later, in a different process:
+        >>> loaded = XGBPriceModel.load(Path("models/xgb_2024-06-01.pkl"))
+        >>> loaded.forecast_24h(df)
+        """
         import pickle
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -724,7 +1151,31 @@ class XGBPriceModel:
 
     @classmethod
     def load(cls, path: Path) -> "XGBPriceModel":
-        """Load a model from disk."""
+        """
+        Load a model from a pickle file previously saved by ``save()``.
+
+        Returns a fully reconstructed ``XGBPriceModel`` instance:
+        the model is already fitted, so you can call ``forecast_24h()`` or
+        ``evaluate()`` immediately without calling ``fit()`` again.
+
+        Parameters
+        ----------
+        path : Path (or str)
+            Path to the ``.pkl`` file saved by ``save()``.
+
+        Returns
+        -------
+        XGBPriceModel
+            A reconstructed instance with ``.model_`` and ``.feature_cols_`` restored.
+
+        Example
+        -------
+        >>> from pathlib import Path
+        >>> model = XGBPriceModel.load(Path("models/xgb_model.pkl"))
+        >>> print(f"Loaded model with {len(model.feature_cols_)} features")
+        Loaded model with 51 features
+        >>> model.forecast_24h(df_recent)  # ready to use immediately
+        """
         import pickle
         with open(path, "rb") as f:
             data = pickle.load(f)

@@ -166,52 +166,158 @@ def _detect_flow_cols(columns: pd.Index) -> Optional[str]:
 
 class FeatureEngineer:
     """
-    Generate features for electricity price forecasting.
+    Transform raw hourly grid + weather data into 51 features ready for XGBoost.
 
-    The class operates in two phases:
+    What this class does
+    ---------------------
+    The raw data you get from ENTSO-E and Open-Meteo looks like this:
 
-    fit_transform(X)  — computes per-row features on training data.
-                        Also records column names and fit statistics
-                        (rolling means/stds, holiday sets) for use in transform().
+        timestamp          price_gr  load_gr  temperature_2m_c  solar_gr  wind_gr
+        2024-05-01 00:00     82.3    5234.0              14.2       0.0     312.4
+        2024-05-01 01:00     79.1    5098.1              13.8       0.0     328.1
+        ...
 
-    transform(X)      — applies the same transformations to new data,
-                        using the statistics learned in fit_transform().
-                        Lag/rolling features that fall outside the observed
-                        range are set to NaN.
+    XGBoost can't just look at that.  It needs to know things like:
+    - "Is this a weekday or weekend?"
+    - "How does the current price compare to the same hour last week?"
+    - "Is it hotter than usual for this time of day?"
+    - "How much solar generation is pushing prices down right now?"
+
+    ``FeatureEngineer`` does exactly that translation.  It takes the raw table
+    and adds ~51 new columns that capture the patterns in the data that
+    XGBoost can use to make predictions.
+
+    How it works — the big picture
+    ------------------------------
+    The class follows the same fit/transform pattern as scikit-learn's
+    ``StandardScaler`` or ``OneHotEncoder``:
+
+    1. ``fit(df)``  — scans the DataFrame to learn which columns exist
+                       (price, load, solar, wind, weather, etc.) and
+                       records statistics needed for later (rolling averages,
+                       holiday calendars, DST dates).  Nothing is added yet.
+
+    2. ``transform(df)`` — adds all ~51 feature columns to the DataFrame
+                          using the knowledge from step 1.
+
+    3. ``fit_transform(df)`` — shorthand for the two steps above.
+
+    The distinction matters when you process test data: you must call ``fit()``
+    on training data first, then call ``transform()`` on both train and test
+    separately.  Never call ``fit()`` on test data — that would discard the
+    statistics learned from training.
+
+    The 7 feature groups (in order)
+    -------------------------------
+    1. Calendar  — hour, day-of-week, month, weekend, Greek holidays, etc.
+    2. Lag       — price T-24h, T-48h, T-168h ago (last week same hour)
+    3. Rolling   — 24h/168h rolling mean and z-score of price
+    4. Weather   — raw + smoothed + anomaly variants of temperature/wind/cloud
+    5. Grid      — residual load, renewable share, load ratios
+    6. DST       — clocks-forward / clocks-back transition flags
+    7. Cyclical  — sin/cos encodings of hour, day-of-week, day-of-year
+
+    Why so many weather variants?
+    -----------------------------
+    Weather forecasts are noisy.  A single temperature reading of 28°C might
+    be a spike or it might be accurate.  By computing the 6-hour and 24-hour
+    rolling averages, the model sees the smoothed trend.  The "anomaly" feature
+    (deviation from the 24h rolling mean) flags when something unusual is
+    happening — a cold snap or heat wave that the model can learn to associate
+    with price spikes.
 
     Parameters
     ----------
     lag_features : tuple of int
-        Lag sizes in hours. Default (24, 48, 168, 336).
+        How far back in time to look for price comparisons, in hours.
+        Default (24, 48, 168, 336) means:
+        - 24h  — price at the same hour yesterday
+        - 48h  — price at the same hour two days ago
+        - 168h — price at the same hour one week ago (same day-of-week)
+        - 336h — price at the same hour two weeks ago
+        Think of these as "what was the price doing around this time recently?"
+
+        The largest lag (336h = 2 weeks) determines how many rows you need
+        before you get useful features.  The first 336 rows will have NaN
+        for all lag features.
+
     rolling_windows : tuple of int
-        Rolling window sizes in hours. Default (24, 168).
+        Time windows (in hours) over which to compute rolling statistics.
+        Default (24, 168) means:
+        - 24h  — captures the short-term daily rhythm (morning ramp, evening drop)
+        - 168h — captures the full weekly cycle
+        These are used to compute rolling mean, rolling std, and z-scores.
+
     holiday_years : tuple of int
-        Which calendar years to include in the Greek holiday set.
-        Default (2024, 2025, 2026, 2027, 2028, 2029, 2030).
+        Which calendar years to include in the Greek public holiday list.
+        Default covers 2024–2030.  Add future years as needed.
+        Greek holidays include New Year's Day, Epiphany, Clean Monday,
+        Independence Day (Mar 25), Easter (Orthodox, variable),
+        Labour Day (May 1), Assumption (Aug 15), Ochi Day (Oct 28),
+        Christmas, and Boxing Day.
+
     include_cyclical : bool
-        If True (default), add sin/cos encoding for hour-of-day and
-        day-of-week — these help tree-based models by encoding
-        the circular nature of time.
+        Whether to add sin/cos encodings for hour-of-day, day-of-week,
+        day-of-year, and month.  Default True.
+        Why sin/cos?  Because hour=23 and hour=0 are neighbours on the clock
+        but numerically very far apart (|23-0| = 23).  Sin/cos encoding
+        solves this: both 23:00 and 00:00 map to the same point on the circle.
+
     include_dst_flag : bool
-        If True (default), flag hours that fall within ±1 day of a
-        DST transition (clocks forward or backward).
+        Whether to flag hours near Daylight Saving Time transitions.
+        Default True.
+        Greece switches clocks forward (02:00→03:00) on the last Sunday of March
+        and back (03:00→02:00) on the last Sunday of October.
+        These transitions cause the hourly data to have either 23 or 25 hours
+        that day, which can confuse models that assume every day has 24 hours.
+        The DST flag explicitly marks those transition days.
 
-    Notes
-    -----
-    Price and weather column names are auto-detected from the DataFrame
-    columns. For Open-Meteo data the standard column names are recognised:
-    ``temperature_2m_c``, ``wind_speed_100m_km_h``, ``cloud_cover``,
-    ``solar_radiation``, ``precipitation``.
+    Attributes (set after fit())
+    -----------------------------
+    price_col_ : str or None
+        Name of the detected price column (e.g. "price_gr").
+    load_col_ : str or None
+        Name of the detected load column (e.g. "load_gr").
+    gen_cols_ : dict
+        Mapping of fuel type → column name for solar, wind, gas, hydro.
+    weather_cols_ : dict
+        Mapping of weather variable → column name for temperature, wind_speed,
+        cloud_cover, solar_irradiance.
+    holiday_set_ : set of date
+        All Greek public holiday dates in the configured years.
+    dst_spring_dates_ : set of datetime
+        Spring-forward transition timestamps (last Sunday of March, 03:00).
+    dst_autumn_dates_ : set of datetime
+        Autumn-back transition timestamps (last Sunday of October, 04:00).
 
-    The ``residual_load`` feature requires load, solar, and wind columns
-    to be present. If any are missing it is silently skipped.
-
-    Examples
-    --------
+    Example usage
+    -------------
     >>> from gridprice.features import FeatureEngineer
+    >>> from gridprice.synthetic_data import SyntheticDataGenerator
+    >>> from datetime import date
+    >>>
+    >>> # Generate some data
+    >>> df = SyntheticDataGenerator(bidding_zone="GR", seed=42, end_date=date(2024, 6, 1)).generate()
+    >>> print(f"Raw columns ({len(df.columns)}): {list(df.columns)}")
+    Raw columns (14): ['price_gr', 'load_gr', 'temperature_2m_c', 'wind_speed_10m_ms', ...]
+    >>>
+    >>> # Step 1 — fit on training data (learn column names + statistics)
     >>> fe = FeatureEngineer()
-    >>> X_train_fe = fe.fit_transform(df_train)
-    >>> X_test_fe  = fe.transform(df_test)
+    >>> fe.fit(df)   # this scans the DataFrame but doesn't change it yet
+    >>>
+    >>> # Step 2 — transform (add all features)
+    >>> df_fe = fe.transform(df)
+    >>> print(f"Feature columns ({len(df_fe.columns)}): {list(df_fe.columns)}")
+    Feature columns (65): ['price_gr', 'load_gr', ..., 'hour', 'day_of_week', 'is_holiday',
+                            'price_lag_24h', 'price_roll_mean_24h', 'residual_load', ...]
+    >>>
+    >>> # Convenience: fit + transform in one call
+    >>> df_fe = FeatureEngineer().fit_transform(df)
+    >>>
+    >>> # First 336 rows have NaN lags — drop them before training
+    >>> df_fe = df_fe.dropna()
+    >>> print(f"After dropna: {len(df_fe)} rows (was {len(df)})")
+    After dropna: 14784 rows (was 15120)
     """
 
     def __init__(
@@ -254,9 +360,42 @@ class FeatureEngineer:
 
     def fit(self, df: pd.DataFrame) -> "FeatureEngineer":
         """
-        Learn column names and per-column statistics from the DataFrame.
+        Learn what columns are available and record statistics needed for features.
 
-        Does NOT add features — use fit_transform() to do both in one call.
+        This is the "learning" step.  It scans ``df`` to:
+
+        - Find which columns contain price, load, generation, and weather data
+          (using name patterns — e.g. any column with "price" in the name is
+          treated as the price column).  Results are stored in ``.price_col_``,
+          ``.load_col_``, etc.
+
+        - Record the most recent rolling mean and rolling standard deviation of
+          the price.  These are used later to compute z-scores for new data.
+
+        - Build the set of Greek public holiday dates for the configured years.
+
+        - Compute DST transition timestamps for the years covered by the data.
+
+        ``fit()`` does NOT add any columns to ``df``.  It only records metadata.
+
+        IMPORTANT: always call ``fit()`` on training data, NOT on test data.
+        If you fit on test data, the model will have seen information it
+        shouldn't have (e.g. the mean price of the test period).
+
+        Parameters
+        ----------
+        df : DataFrame with DatetimeIndex
+            Training data.  Must have a timezone-aware DatetimeIndex
+            (required for DST flag calculations).
+
+        Returns
+        -------
+        self (allows chaining: ``fe = FeatureEngineer().fit(df)``)
+
+        Raises
+        ------
+        ValueError
+            If the DataFrame has no detected price column.
         """
         cols = df.columns
 
@@ -267,7 +406,8 @@ class FeatureEngineer:
         self.weather_cols_ = _detect_weather_cols(cols)
         self.flow_col_ = _detect_flow_cols(cols)
 
-        # Rolling statistics for price
+        # Rolling statistics for price — last value observed in the series
+        # Used as a fallback for z-score normalisation on new data
         if self.price_col_:
             price = df[self.price_col_]
             for w in self.rolling_windows:
@@ -296,11 +436,51 @@ class FeatureEngineer:
 
     def transform(self, df: pd.DataFrame) -> pd.DataFrame:
         """
-        Apply all feature transformations to df.
+        Add all ~51 feature columns to the DataFrame.
 
-        Uses column names and statistics learned in fit().
-        Rows whose lag/rolling windows extend before the start of the
-        fitted data will have those features set to NaN.
+        Call this after ``fit()`` — it uses the column names and statistics
+        recorded during fitting to add the following feature groups:
+
+        1. Calendar    — ``hour``, ``day_of_week``, ``month``, ``is_weekend``,
+                          ``is_holiday``, ``is_holiday_eve``, ``day_of_year``,
+                          ``week_of_year``, ``part_of_day``
+        2. Lag         — ``price_lag_24h``, ``price_lag_48h``, ``price_lag_168h``,
+                          ``price_lag_336h``, ``price_weekly_delta``,
+                          ``price_pct_change_24h``
+        3. Rolling     — ``price_roll_mean_24h``, ``price_roll_zscore_24h``,
+                          ``price_roll_mean_168h``, ``price_roll_zscore_168h``,
+                          ``price_vs_7d_mean``
+        4. Weather    — ``weather_{var}_raw``, ``weather_{var}_roll6h``,
+                          ``weather_{var}_roll24h``, ``weather_{var}_anomaly``
+                          for temperature, wind_speed, cloud_cover,
+                          solar_irradiance (+ ``solar_estimated_cf``)
+        5. Grid       — ``residual_load``, ``residual_load_pct``,
+                          ``renewable_share``, ``solar_to_residual``,
+                          ``net_import``, ``load_roll24h``, ``load_pct_of_7d``
+        6. DST        — ``is_dst_spring``, ``is_dst_autumn``,
+                          ``is_dst_transition``
+        7. Cyclical   — ``hour_of_week``, ``hour_sin``, ``hour_cos``,
+                          ``dow_sin``, ``dow_cos``, ``doy_sin``, ``doy_cos``,
+                          ``month_sin``, ``month_cos``
+
+        Rows at the start of the series (before enough history exists for
+        lag and rolling features) will have NaN in those columns.  Drop them
+        with ``df.dropna()`` before training.
+
+        Parameters
+        ----------
+        df : DataFrame with DatetimeIndex
+            Raw data in the same format as passed to ``fit()``.
+
+        Returns
+        -------
+        DataFrame with all original columns plus new feature columns.
+        The original DataFrame is not modified.
+
+        Raises
+        ------
+        ValueError
+            If ``fit()`` has not been called yet.
         """
         if not self.fitted_columns_:
             raise ValueError("FeatureEngineer has not been fitted. Call fit() or fit_transform() first.")
@@ -332,7 +512,19 @@ class FeatureEngineer:
         return result
 
     def fit_transform(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Convenience: fit() then transform() in one call."""
+        """
+        Convenience: run ``fit()`` then ``transform()`` in a single call.
+
+        Equivalent to: ``fe = FeatureEngineer(); fe.fit(df); return fe.transform(df)``
+
+        Use this when you just need features for training (one-shot) or when
+        you are sure no separate test-time transformation is needed.
+
+        For a proper train/test split, call ``fit_transform()`` on training
+        data only, then call ``transform()`` (not ``fit_transform()``) on test
+        data to avoid information leakage from the test period leaking into
+        the feature statistics.
+        """
         self.fit(df)
         return self.transform(df)
 
@@ -341,7 +533,46 @@ class FeatureEngineer:
     def _add_calendar_features(
         self, result: pd.DataFrame, idx: pd.DatetimeIndex
     ) -> pd.DataFrame:
-        """Add hour, day-of-week, month, is_weekend, is_holiday."""
+        """
+        Add calendar-based features derived from the timestamp index.
+
+        What each feature means for electricity prices
+        ---------------------------------------------
+        ``hour`` — Prices follow a daily rhythm: low at night (3am trough),
+          double-peak on weekdays (morning ~10h, evening ~17h), high in winter.
+
+        ``day_of_week`` — Weekends have a completely different demand profile:
+          no morning industrial ramp, lower peak demand, different solar profile.
+
+        ``month`` — Seasonal demand: heating in Jan/Feb, cooling from Jun/Aug.
+          Prices in summer may spike due to AC demand even if fuel is cheap.
+
+        ``is_weekend`` — Binary flag for Sat/Sun.  XGBoost can split on this
+          directly but the separate ``day_of_week`` helps too.
+
+        ``is_holiday`` — Holidays eliminate industrial and commercial demand.
+          Athens on Christmas Day has dramatically lower prices than a normal Tue.
+
+        ``is_holiday_eve`` — Christmas Eve, New Year's Eve, etc. have reduced
+          but not eliminated demand (half-day working).
+
+        ``day_of_year`` — Captures longer seasonal patterns (e.g. heating
+          season vs cooling season) beyond what month captures.
+
+        ``week_of_year`` — Week 1 vs Week 52 may have special patterns.
+
+        ``part_of_day`` — 4 buckets: night (0–6h), morning (6–12h),
+          afternoon (12–18h), evening (18–24h).  Crude but helps XGBoost
+          find intraday patterns without needing to learn hour=23 is
+          "similar to" hour=0 (that's what cyclical features are for).
+
+        Parameters
+        ----------
+        result : DataFrame
+            Working copy of the DataFrame; modified in place.
+        idx : DatetimeIndex
+            The timestamp index of ``result``.
+        """
         result["hour"] = idx.hour
         result["day_of_week"] = idx.dayofweek          # 0=Mon, 6=Sun
         result["month"] = idx.month
@@ -380,8 +611,75 @@ class FeatureEngineer:
 
         return result
 
+        # Greek holiday flag — work with tz-naive dates directly
+        dates_naive = idx.normalize()  # DatetimeIndex (tz-naive after normalization)
+
+        result["is_holiday"] = pd.Series(
+            [ts.date() in self.holiday_set_ for ts in dates_naive],
+            index=result.index,
+            dtype=int,
+        )
+
+        # Is holiday Eve? (lower activity the day before major holidays)
+        # Shift dates forward by 1 day using Timedelta
+        eve_dates_naive = dates_naive + pd.Timedelta(days=1)
+        result["is_holiday_eve"] = pd.Series(
+            [ts.date() in self.holiday_set_ for ts in eve_dates_naive],
+            index=result.index,
+            dtype=int,
+        )
+
+        # Day of year (for seasonal signal)
+        result["day_of_year"] = idx.dayofyear
+        # Week of year
+        result["week_of_year"] = idx.isocalendar().week.astype(int)
+
+        # Part-of-day buckets (4 bins: night, morning, afternoon, evening)
+        hour = idx.hour
+        result["part_of_day"] = pd.cut(
+            hour,
+            bins=[-1, 6, 12, 18, 24],
+            labels=[0, 1, 2, 3],          # 0=night, 1=morning, 2=afternoon, 3=evening
+        ).astype(int)
+
+        return result
+
     def _add_lag_features(self, result: pd.DataFrame) -> pd.DataFrame:
-        """Add price lag features: T-24h, T-48h, T-168h, T-336h."""
+        """
+        Add lagged price features: what was the price N hours ago?
+
+        The intuition: electricity prices are highly autocorrelated.
+        If the price right now is €85/MWh and it was €83/MWh at the same
+        hour yesterday, it's very likely to be around €80–90 tomorrow too.
+        Lag features let XGBoost learn this pattern.
+
+        What each lag means
+        --------------------
+        ``price_lag_24h`` — Same hour yesterday.  The single most powerful feature
+            for daily seasonality.  "Price at 9am today ≈ price at 9am yesterday."
+
+        ``price_lag_48h`` — Same hour two days ago.  Helps when there's a
+            multi-day trend (e.g. a cold snap lasting 3 days).
+
+        ``price_lag_168h`` — Same hour last week (7 days).  The most important
+            lag for weekly seasonality.  "Price at 9am on a Wednesday tends
+            to be similar to last Wednesday's price."
+
+        ``price_lag_336h`` — Same hour two weeks ago.  Captures bi-weekly patterns
+            and provides redundancy if 168h data is missing.
+
+        ``price_weekly_delta`` — Change over the past week:
+            ``price_now - price_same_hour_last_week``.
+            A rising price trend is often predictive of continued rising prices
+            (e.g. sustained cold weather pushing up demand).
+
+        ``price_pct_change_24h`` — Percentage change from yesterday to today.
+            Captures momentum: if prices jumped 20% overnight, something unusual
+            is happening (cold front, outage, etc.) and may persist.
+
+        The first 336 rows will have NaN for all lag features — this is
+        expected and is handled by dropping NaN rows before training.
+        """
         if not self.price_col_:
             return result
 
@@ -406,7 +704,31 @@ class FeatureEngineer:
         return result
 
     def _add_rolling_features(self, result: pd.DataFrame) -> pd.DataFrame:
-        """Add rolling mean and std of price over configured windows."""
+        """
+        Add rolling-window statistics of the price.
+
+        The intuition: comparing the current price to its recent history
+        tells you whether the market is "hot" or "cold" right now.
+
+        What each feature means
+        -----------------------
+        ``price_roll_mean_{w}h`` — Average price over the past W hours.
+            E.g. ``price_roll_mean_24h`` is the average of the last 24 hours.
+            A current price far above its 24h average signals an unusual event.
+
+        ``price_roll_zscore_{w}h`` — How many standard deviations the current
+            price is from its recent average:
+            ``z = (price_now - roll_mean_w) / roll_std_w``
+
+            A z-score of +2 means "the current price is 2 standard deviations
+            above the recent average" — a strong signal that something unusual
+            is happening.  This is the model's most important feature.
+
+        ``price_vs_7d_mean`` — Difference between the current price and the
+            average price over the past 7 days (168 hours).  More stable than
+            the 24h mean, captures whether you're in a high-price or low-price
+            week relative to the recent past.
+        """
         if not self.price_col_:
             return result
 
@@ -432,7 +754,46 @@ class FeatureEngineer:
         return result
 
     def _add_weather_features(self, result: pd.DataFrame) -> pd.DataFrame:
-        """Add raw weather + rolling means."""
+        """
+        Add weather-derived features: temperature, wind, cloud cover, solar.
+
+        The intuition: weather is the most important external driver of
+        electricity prices.  A heat wave → air conditioning → higher demand →
+        higher prices.  High solar output → renewable generation displaces
+        expensive gas plants → lower prices (the "duck curve").
+
+        Why 4 variants per weather variable?
+        ------------------------------------
+        Weather forecasts are uncertain.  A single temperature reading might
+        be a forecast glitch.  By including all three variants, the model can
+        learn which level of smoothing is most predictive and when to weight
+        the raw reading heavily vs. the smoothed trend.
+
+        What each variant means
+        ------------------------
+        ``weather_{var}_raw`` — The raw current value.
+            E.g. current temperature = 31°C.  Tells the model the immediate
+            condition.  Also useful when conditions are changing fast
+            (a rapid temperature drop during a storm).
+
+        ``weather_{var}_roll6h`` — Average over the past 6 hours.
+            Smooths out hourly noise and forecast jitter.  Helps the model
+            ignore brief anomalies and focus on the sustained weather trend.
+
+        ``weather_{var}_roll24h`` — Average over the past 24 hours.
+            Even smoother.  Captures whether the current weather episode
+            is a multi-day event (e.g. a heat wave lasting 5 days).
+
+        ``weather_{var}_anomaly`` — Deviation from the 24h rolling average:
+            ``anomaly = raw - roll24h_mean``
+            A positive anomaly means "hotter than recent average" — useful for
+            flagging heat waves or cold snaps that the 24h mean alone would miss.
+
+        ``solar_estimated_cf`` — Estimated solar capacity factor (0–1).
+            Derived from solar irradiance: ``irradiance_Wm2 / 1000``.
+            This is the model's approximation of how much solar generation
+            is displacing fossil fuel plants at any given hour.
+        """
         for feat_name, col_name in self.weather_cols_.items():
             col = result[col_name]
 
@@ -463,7 +824,53 @@ class FeatureEngineer:
         return result
 
     def _add_grid_features(self, result: pd.DataFrame) -> pd.DataFrame:
-        """Compute residual load and net import features."""
+        """
+        Add grid-level features: residual load, renewable penetration, and load ratios.
+
+        The intuition: the electricity market clears when total demand (load)
+        meets total supply (generation).  The price is set by the marginal
+        (most expensive) plant that must run to meet demand.  Grid features
+        capture supply/demand balance directly.
+
+        What each feature means
+        -----------------------
+        ``residual_load`` — "Net demand" that non-renewable plants must serve:
+            ``residual_load = load - solar - wind``
+
+            If residual load is high, expensive gas plants must run
+            → prices rise.  If residual load is low (high solar/wind),
+            cheap renewables set the price → prices fall.
+            This is the most economically meaningful feature.
+
+        ``residual_load_pct`` — The percentile rank of the current residual load
+            within the historical distribution.  A value of 0.9 means "residual
+            load is in the top 10% of all-time levels" — a strong demand signal.
+
+        ``renewable_share`` — Fraction of total load met by solar + wind:
+            ``renewable_share = (solar + wind) / load``
+
+            High renewable share → oversupply → low prices.
+            This captures the fundamental market dynamic of renewable-driven
+            price suppression.
+
+        ``solar_to_residual`` — Ratio of solar generation to residual load:
+            ``solar / residual_load``
+
+            A value > 1 means solar alone covers all residual demand —
+            the "duck curve" situation at midday where prices can go negative.
+            This is the key driver of Greece's midday price dips.
+
+        ``net_import`` — Net electricity import from interconnectors.
+            Positive = importing, Negative = exporting.
+            Imports from neighbouring zones can cap local prices.
+
+        ``load_roll24h`` — 24-hour rolling average of total load.
+            Smoothed demand signal, complementary to the raw load.
+
+        ``load_pct_of_7d`` — Current load as a fraction of the past 7-day
+            average load at this hour.  Captures demand anomalies
+            (e.g. "today's demand is 15% above the recent norm for this hour").
+        """
         # Residual load = load - solar - wind
         if self.load_col_ and "solar" in self.gen_cols_ and "wind" in self.gen_cols_:
             load = result[self.load_col_]
@@ -495,7 +902,35 @@ class FeatureEngineer:
         return result
 
     def _add_dst_flag(self, result: pd.DataFrame, idx: pd.DatetimeIndex) -> pd.DataFrame:
-        """Flag hours near DST transitions."""
+        """
+        Flag hours near Daylight Saving Time (DST) clock transitions.
+
+        Why DST matters for hourly data
+        -------------------------------
+        Greece changes clocks in March (spring forward: 02:00→03:00, one 23h day)
+        and October (autumn back: 03:00→02:00, one 25h day).
+
+        A naive model treating every "hour 2–3am" as a single hour will see:
+        - In March: only 23 data rows for that day → missing hour → NaN lag features
+        - In October: 25 rows for that day → duplicated hour → overlapping lag windows
+
+        The DST flags explicitly mark transition days so the model can learn to
+        handle them differently (or ignore them entirely).  Without this flag,
+        XGBoost would try to fit these days as unusual patterns rather than
+        known structural anomalies.
+
+        What each flag means
+        ---------------------
+        ``is_dst_spring`` — 1 if this hour falls within ±1 day of the spring
+            forward transition (last Sunday of March, 03:00).  These days have
+            23 hours.  Expect lag features to be misaligned.
+
+        ``is_dst_autumn`` — 1 if this hour falls within ±1 day of the autumn
+            back transition (last Sunday of October, 04:00).  These days have
+            25 hours.  Expect duplicate lag entries.
+
+        ``is_dst_transition`` — Either of the above (OR).  A simple summary flag.
+        """
         if not self.include_dst_flag:
             return result
 
@@ -529,7 +964,52 @@ class FeatureEngineer:
     def _add_cyclical_features(
         self, result: pd.DataFrame, idx: pd.DatetimeIndex
     ) -> pd.DataFrame:
-        """Add sin/cos encoding for hour-of-day and day-of-week."""
+        """
+        Add sin/cos cyclical encodings for time-based features.
+
+        Why sin/cos encoding?
+        ---------------------
+        Plain integer encoding of time creates a false ordering problem:
+
+            hour=23 and hour=0 are neighbours on the clock,
+            but numerically |23 - 0| = 23 — a huge distance.
+            XGBoost would think hour 23 is "far from" hour 0.
+
+        The solution: map each cyclic value onto a unit circle.
+
+        For hours (24-hour cycle):
+            hour_sin = sin(2π × hour / 24)
+            hour_cos = cos(2π × hour / 24)
+
+        This way:
+            hour=23 → sin ≈ -0.26, cos ≈ 0.97  ← close to
+            hour=0  → sin = 0,       cos = 1.0  ← close to
+            hour=12 → sin = 0,       cos = -1   ← opposite
+
+        XGBoost can use both the sin and cos columns together to reconstruct
+        the original hour.  The sin/cos pair is more informative than the
+        raw integer because it makes the circular relationship explicit.
+
+        What each feature encodes
+        -------------------------
+        ``hour_of_week`` — Integer 0–167: which hour within the week this is.
+            ``hour_of_week = day_of_week × 24 + hour``.
+            E.g. Monday 9am = 0×24 + 9 = 9; Tuesday 9am = 1×24 + 9 = 33.
+            This captures the full weekly schedule in one integer.
+
+        ``hour_sin``, ``hour_cos`` — Circular encoding of hour of day.
+            Together these two values encode any hour uniquely.
+
+        ``dow_sin``, ``dow_cos`` — Circular encoding of day of week.
+            XGBoost can use these to learn that Monday and Sunday are
+            "close" (Sunday=6, Monday=0) even though numerically they are far.
+
+        ``doy_sin``, ``doy_cos`` — Circular encoding of day of year.
+            Captures that Jan 1 and Dec 31 are adjacent (seasonal wraparound).
+
+        ``month_sin``, ``month_cos`` — Circular encoding of month.
+            Captures seasonal wraparound at the year boundary.
+        """
         if not self.include_cyclical:
             return result
 
@@ -566,7 +1046,23 @@ class FeatureEngineer:
         """
         Return the names of all features that this engineer produces.
 
-        Only valid after fit() has been called.
+        Useful for debugging, for checking which columns a model was trained on,
+        and for verifying that a new DataFrame has all required features.
+
+        Returns
+        -------
+        list of str
+            Feature names in a consistent order (calendar → lag → rolling
+            → weather → grid → DST → cyclical).
+
+        Example
+        -------
+        >>> fe = FeatureEngineer().fit(df)
+        >>> model_features = fe.feature_names()
+        >>> print(f"Model uses {len(model_features)} features")
+        Model uses 51 features
+        >>> print(model_features[:5])
+        ['hour', 'day_of_week', 'month', 'is_weekend', 'is_holiday']
         """
         if not self.fitted_columns_:
             raise ValueError("FeatureEngineer has not been fitted.")
@@ -628,13 +1124,41 @@ def engineer_features(
     include_dst_flag: bool = True,
 ) -> pd.DataFrame:
     """
-    One-shot feature engineering.
+    One-shot feature engineering: create and apply FeatureEngineer in a single call.
 
-    Creates and fits a FeatureEngineer on df and returns the transformed
-    DataFrame with all features added.
+    This is a convenience function equivalent to:
+        ``fe = FeatureEngineer(...); return fe.fit_transform(df)``
 
-    Use this when you don't need the fitted transformer for later use.
-    For train/test pipelines, use the FeatureEngineer class directly.
+    When to use this vs. the class directly
+    ----------------------------------------
+    Use ``engineer_features()`` for:
+    - Quick prototyping and notebook exploration
+    - Scripts that don't need to persist the fitted transformer
+    - One-off data transformations where you won't reuse the transformer
+
+    Use ``FeatureEngineer`` class directly when:
+    - You need to apply the same transformation to multiple DataFrames
+      (e.g. train → test) and must keep the transformer state consistent
+    - You want to save the transformer to disk alongside the model
+
+    Parameters
+    ----------
+    df : DataFrame with DatetimeIndex
+        Raw hourly data (same parameters as ``FeatureEngineer.__init__``).
+    lag_features, rolling_windows, holiday_years,
+    include_cyclical, include_dst_flag : same as ``FeatureEngineer.__init__``
+        Passed directly to the ``FeatureEngineer`` constructor.
+
+    Returns
+    -------
+    DataFrame with all ~51 feature columns added.
+
+    Example
+    -------
+    >>> df_fe = engineer_features(df, lag_features=(24, 48, 168, 336))
+    >>> df_fe = df_fe.dropna()  # drop warmup rows
+    >>> print(df_fe.shape)
+    (14784, 65)
     """
     fe = FeatureEngineer(
         lag_features=lag_features,

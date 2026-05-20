@@ -2,7 +2,7 @@ env/
 .venv/
 __pycache__/
 *.pyc
-*.zipt s
+*.zip
 .pytest_cache/
 data/raw/*.parquet
 data/interim/*
