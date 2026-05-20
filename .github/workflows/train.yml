@@ -1,0 +1,115 @@
+name: Daily Training Pipeline
+
+# Run every day at 12:00 UTC (14:00 Athens / EET)
+on:
+  schedule:
+    - cron: "0 12 * * *"
+  # Allow manual trigger from the Actions tab
+  workflow_dispatch:
+    inputs:
+      end_date:
+        description: "End date for training data (YYYY-MM-DD)"
+        required: false
+        default: ""
+      retrain:
+        description: "Force retrain even if model is recent"
+        type: boolean
+        default: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  # ⚠️  Add ENTSOE_API_KEY as a repository secret (Settings → Secrets)
+  # Required for live data fetch. Without it, pipeline falls back to
+  # cached / synthetic data.
+
+jobs:
+  train:
+    name: Train & Backtest
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # for PR comments with results
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # ── Data fetch ──────────────────────────────────────────────────
+      - name: Fetch ENTSO-E data
+        if: env.ENTSOE_API_KEY != ''
+        run: |
+          . .venv/bin/activate
+          python -m src.gridprice.pipeline fetch --config config.yaml
+        env:
+          ENTSOE_API_KEY: ${{ secrets.ENTSOE_API_KEY }}
+
+      - name: Fetch public sample data (no API key)
+        if: env.ENTSOE_API_KEY == ''
+        run: |
+          . .venv/bin/activate
+          make fetch-sample
+
+      # ── Train model ────────────────────────────────────────────────
+      - name: Train XGBoost model
+        run: |
+          . .venv/bin/activate
+          if [ "${{ github.event.inputs.retrain }}" == "true" ]; then
+            python -m src.gridprice.pipeline train --config config.yaml
+          else
+            python -m src.gridprice.pipeline train --config config.yaml --no-retrain
+          fi
+
+      # ── Backtest ───────────────────────────────────────────────────
+      - name: Run expanding-window backtest
+        run: |
+          . .venv/bin/activate
+          python -m src.gridprice.pipeline backtest \
+            --config config.yaml \
+            --backtest-days 365
+
+      # ── Upload artifacts ───────────────────────────────────────────
+      - name: Upload backtest metrics
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-metrics
+          path: |
+            reports/metrics/*.csv
+            reports/figures/*.png
+          retention-days: 30
+
+      - name: Upload trained model
+        uses: actions/upload-artifact@v4
+        with:
+          name: trained-model
+          path: models/xgb_model.pkl
+          retention-days: 30
+
+      # ── Comment on PR (if triggered from a PR) ────────────────────
+      - name: Post results as PR comment
+        if: github.event_name == 'pull_request'
+        run: |
+          . .venv/bin/activate
+          python -c "
+          import pandas as pd, pathlib
+          metrics_dir = pathlib.Path('reports/metrics')
+          if metrics_dir.exists():
+              daily = metrics_dir / 'backtest_daily.csv'
+              if daily.exists():
+                  df = pd.read_csv(daily)
+                  mae = df['MAE'].mean()
+                  rmse = df['RMSE'].mean()
+                  print(f'::notice:: Daily pipeline MAE={mae:.2f} EUR/MWh, RMSE={rmse:.2f}')
+          "

@@ -1,0 +1,47 @@
+# GridPrice — Configuration
+# Environment variables always override these values.
+# See: README.md § Environment Variables
+
+bidding_zone: "GR"
+
+# ── ENTSO-E Transparency Platform ────────────────────────────────────────────
+# Get a free API key at: https://transparency.entsoe.eu/
+# Set the ENTOSE_API_KEY environment variable to override.
+entsoe:
+  api_key: ""                       # ← set via ENTOSE_API_KEY env var
+  area_type: "BZN"                  # Bidding Zone
+  area_id: "10YGR-HTSO-----Y"       # Greek bidding zone (Hellenic TSO)
+
+# ── Open-Meteo Weather ───────────────────────────────────────────────────────
+# Athens coordinates (city centre). Adjust for your target zone.
+open_meteo:
+  latitude: 37.9838
+  longitude: 23.7275
+  forecast_days: 7                   # fetch N days ahead
+
+# ── Directory layout ─────────────────────────────────────────────────────────
+data_dir: "data"
+raw_dir: "data/raw"
+interim_dir: "data/interim"
+processed_dir: "data/processed"
+models_dir: "models"
+reports_dir: "reports"
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+model:
+  path: "models/xgb_model.pkl"
+  n_estimators: 200                  # early stopping usually cuts < 200
+  max_depth: 6
+  learning_rate: 0.05
+  subsample: 0.8
+  colsample_bytree: 0.8
+  reg_lambda: 1.0
+  reg_alpha: 0.1
+  min_train_size: 4320               # 24 * 180 = ~6 months
+  val_size: 168                     # 1 week early-stopping holdout
+
+# ── Pipeline ─────────────────────────────────────────────────────────────────
+pipeline:
+  backtest_days: 365                # days of data for backtest
+  retrain_threshold_days: 30         # auto-retrain if model is older than this
+  notify_on_error: false
